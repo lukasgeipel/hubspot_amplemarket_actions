@@ -134,25 +134,30 @@ def matches_target(title):
         return True
     # President only if not a Vice/E/S/A-VP President
     return bool(_PRESIDENT_RE.search(_VP_STRIP_RE.sub(" ", t)))
-LOCATIONS = ["United States"]       # person_locations search filter; set to [] to disable
+LOCATIONS = ["United States", "Canada"]   # person_locations search filter; set to [] to disable
 
-# Require contacts to be US-based. This is a second check on the person's actual
-# country (search-side location filters can leak), applied at search time and
-# again after enrichment. A blank/unknown country trusts the search filter.
-REQUIRE_US = True
-US_COUNTRY_NAMES = {"united states", "united states of america", "usa", "us", "u s a"}
+# Require contacts to be based in an allowed country (US or Canada). This is a
+# second check on the person's actual country (search-side location filters can
+# leak), applied at search time and again after enrichment. A blank/unknown
+# country trusts the search filter.
+REQUIRE_ALLOWED_COUNTRY = True
+ALLOWED_COUNTRY_NAMES = {
+    "united states", "united states of america", "usa", "us", "u s a",
+    "canada", "ca",
+}
 
 
-def is_us_person(person):
-    """True if the person is US-based, judged by location_details.country.
-    Unknown/blank country -> True (trusts the person_locations search filter)."""
-    if not REQUIRE_US:
+def is_allowed_country(person):
+    """True if the person is in an allowed country (US/Canada), judged by
+    location_details.country. Unknown/blank country -> True (trusts the
+    person_locations search filter)."""
+    if not REQUIRE_ALLOWED_COUNTRY:
         return True
     ld = person.get("location_details") or {}
     country = re.sub(r"[^a-z ]", " ", (ld.get("country") or "").lower())
     country = re.sub(r"\s+", " ", country).strip()
     if country:
-        return country in US_COUNTRY_NAMES
+        return country in ALLOWED_COUNTRY_NAMES
     return True
 
 MAX_PER_DOMAIN = 10                 # cap kept contacts per domain (0 = no cap) -> controls credit spend
@@ -630,7 +635,7 @@ def main():
     if trigger_mode:
         print(f"== find_full_contacts | TRIGGER MODE | {len(company_ids)} company id(s) | "
               f"{len(TITLES)} titles | {'DRY RUN' if args.dry_run else 'LIVE'} ==")
-        print(f"   gate: LinkedIn AND Phone AND Email | cap/company: {cap or 'none'}\n")
+        print(f"   gate: Email required (phone/LinkedIn optional) | cap/company: {cap or 'none'}\n")
         print("Reading trigger companies from HubSpot...")
         company_by_domain = hubspot.read_companies(company_ids)
         missing = []
@@ -640,7 +645,7 @@ def main():
             sys.exit("No domains found in input.")
         print(f"== find_full_contacts | {len(domains)} domains | {len(TITLES)} titles | "
               f"{'DRY RUN' if args.dry_run else 'LIVE'} ==")
-        print(f"   gate: LinkedIn AND Phone AND Email | cap/domain: {cap or 'none'}\n")
+        print(f"   gate: Email required (phone/LinkedIn optional) | cap/domain: {cap or 'none'}\n")
         print("Resolving domains to HubSpot companies...")
         company_by_domain = hubspot.companies_by_domain(domains)
         missing = [d for d in domains if d not in company_by_domain]
@@ -667,6 +672,30 @@ def main():
     stats = {c["id"]: {"name": c["name"], "found": 0, "email": 0,
                        "linkedin": 0, "phone": 0, "pushed": 0}
              for c in company_by_domain.values()}
+
+    def write_company_summaries():
+        """Write the summary Note (and optional done-flag) on every company —
+        including companies where 0 contacts were found."""
+        if args.dry_run or not (ADD_COMPANY_NOTE or COMPANY_ICP_DONE_PROPERTY):
+            return
+        for cid, st in stats.items():
+            if ADD_COMPANY_NOTE:
+                n = st["found"]
+                body = (f"<b>Amplemarket enrichment — {time.strftime('%Y-%m-%d %H:%M')} UTC</b><br>"
+                        f"ICP contacts found: <b>{n}</b><br>"
+                        f"Coverage: email {st['email']}/{n}, "
+                        f"LinkedIn {st['linkedin']}/{n}, phone {st['phone']}/{n}<br>"
+                        f"Contacts pushed to HubSpot (email required): "
+                        f"<b>{st['pushed']}</b>")
+                try:
+                    hubspot.create_note_on_company(cid, body)
+                except RuntimeError as exc:
+                    print(f"  [warn] note failed for company {cid}: {exc}")
+            if COMPANY_ICP_DONE_PROPERTY:
+                try:
+                    hubspot.update_company(cid, {COMPANY_ICP_DONE_PROPERTY: "true"})
+                except RuntimeError as exc:
+                    print(f"  [warn] company flag failed for {cid}: {exc}")
 
     log_rows = [{"stage": "resolve", "action": "skipped_no_company", "domain": d} for d in missing]
 
@@ -702,7 +731,7 @@ def main():
                 if not matches_target(person.get("title")):     # keep target roles, drop the rest
                     filtered_titles += 1
                     continue
-                if not is_us_person(person):                     # US-based only
+                if not is_allowed_country(person):               # US/Canada only
                     filtered_location += 1
                     continue
                 candidates[lin] = {"linkedin_url": person.get("linkedin_url"),
@@ -716,7 +745,7 @@ def main():
                     or page >= (pg.get("total_pages") or page):
                 break
     print(f"  {len(candidates)} on-target people (dropped {filtered_titles} off-target/excluded "
-          f"titles, {filtered_location} non-US) across {len(resolvable)} domains.\n")
+          f"titles, {filtered_location} out-of-region) across {len(resolvable)} domains.\n")
 
     for _info in candidates.values():                      # per-company: people found
         if _info["company_id"] in stats:
@@ -735,7 +764,8 @@ def main():
 
     if not candidates and not args.resume:
         write_log_csv("find_full_contacts", log_rows)
-        print("Nothing to enrich.")
+        write_company_summaries()          # still note the company: "0 contacts found"
+        print("Nothing to enrich — wrote 0-found note to the company.")
         return
 
     # ---- 3. enrich ------------------------------------------------------------
@@ -785,22 +815,21 @@ def main():
             log_rows.append({"stage": "gate", "action": rstatus, "domain": info["domain"],
                              "company": info["company_name"], "name": info["name"]})
             continue
-        if not (email and phone and linkedin_url):
-            miss = ",".join(f for f, v in [("email", email), ("phone", phone),
-                                           ("linkedin", linkedin_url)] if not v)
-            log_rows.append({"stage": "gate", "action": "skipped_incomplete", "missing": miss,
+        if not email:                                     # EMAIL is the only hard requirement
+            log_rows.append({"stage": "gate", "action": "skipped_no_email",
                              "domain": info["domain"], "company": info["company_name"],
-                             "name": info["name"], "email": email, "phone": phone})
+                             "name": info["name"], "phone": phone, "linkedin": linkedin_url})
             continue
-        if not is_us_person(person):                      # US-based only (enriched country)
-            log_rows.append({"stage": "gate", "action": "skipped_non_us",
+        if not is_allowed_country(person):                # US/Canada only (enriched country)
+            log_rows.append({"stage": "gate", "action": "skipped_out_of_region",
                              "domain": info["domain"], "company": info["company_name"],
                              "name": info["name"],
                              "country": (person.get("location_details") or {}).get("country")})
             continue
         gated.append((email, phone, linkedin_url, person, info))
 
-    print(f"Passed the LinkedIn+Phone+Email gate: {len(gated)} of {len(candidates)}.\n")
+    print(f"Passed the email gate: {len(gated)} of {len(candidates)} "
+          f"(phone/LinkedIn optional).\n")
 
     # ---- 4b. email validation -------------------------------------------------
     # Validate every gated email via Amplemarket, keep only accepted results.
@@ -921,7 +950,12 @@ def main():
                              "changed": ",".join(sorted(update)) if update else "",
                              "existing_batch_kept": batch_kept})
         else:
-            props = {"email": email, "phone": phone, **desired}
+            props = {"email": email}
+            if phone:
+                props["phone"] = phone
+            for prop, val in desired.items():             # skip any blank (missing linkedin/title/name)
+                if val:
+                    props[prop] = val
             if ICP_PROPERTY:
                 props[ICP_PROPERTY] = "true"
             if CONTACT_BATCH_PROPERTY and BATCH_TAG:
@@ -932,7 +966,9 @@ def main():
                 again = hubspot.batch_read_contacts_by_email([email], CONTACT_PROPS).get(email.lower())
                 if again:
                     ag_cur = again.get("properties", {})
-                    recover = {"phone": phone, "email": email}
+                    recover = {"email": email}
+                    if phone:
+                        recover["phone"] = phone
                     if ICP_PROPERTY:
                         recover[ICP_PROPERTY] = "true"
                     ag_batch = (ag_cur.get(CONTACT_BATCH_PROPERTY) or "").strip() if CONTACT_BATCH_PROPERTY else ""
@@ -973,25 +1009,7 @@ def main():
     path = write_log_csv("find_full_contacts", log_rows)
 
     # ---- 5. per-company summary note + optional "done" flag ------------------
-    if not args.dry_run and (ADD_COMPANY_NOTE or COMPANY_ICP_DONE_PROPERTY):
-        for cid, st in stats.items():
-            if ADD_COMPANY_NOTE:
-                n = st["found"]
-                body = (f"<b>Amplemarket enrichment — {time.strftime('%Y-%m-%d %H:%M')} UTC</b><br>"
-                        f"ICP contacts found: <b>{n}</b><br>"
-                        f"Coverage: email {st['email']}/{n}, "
-                        f"LinkedIn {st['linkedin']}/{n}, phone {st['phone']}/{n}<br>"
-                        f"Full-profile contacts (email + phone + LinkedIn) pushed to HubSpot: "
-                        f"<b>{st['pushed']}</b>")
-                try:
-                    hubspot.create_note_on_company(cid, body)
-                except RuntimeError as exc:
-                    print(f"  [warn] note failed for company {cid}: {exc}")
-            if COMPANY_ICP_DONE_PROPERTY:
-                try:
-                    hubspot.update_company(cid, {COMPANY_ICP_DONE_PROPERTY: "true"})
-                except RuntimeError as exc:
-                    print(f"  [warn] company flag failed for {cid}: {exc}")
+    write_company_summaries()
 
     batch_conflict_path = ""
     if batch_conflicts:
@@ -1007,7 +1025,7 @@ def main():
     print(f"\nDone."
           f"\n  Searched      : {len(resolvable)} domains"
           f"\n  With LinkedIn : {len(candidates)}"
-          f"\n  Full+valid    : {len(gated)} (LinkedIn+Phone+Email"
+          f"\n  Kept (email)  : {len(gated)} (email required; phone/LinkedIn optional"
           + (f"+validated" if VALIDATE_EMAILS else "") + ")"
           f"\n  Created       : {created_n}"
           f"\n  Updated       : {updated_n}  (blanks filled / email+phone replaced)"
