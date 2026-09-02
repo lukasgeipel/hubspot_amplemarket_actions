@@ -57,6 +57,38 @@ try:
 except ImportError:
     sys.exit("This script needs the 'requests' package. Install it with:\n  pip install requests")
 
+from requests.adapters import HTTPAdapter
+try:
+    from urllib3.util.retry import Retry
+except Exception:                       # very old urllib3 fallback
+    from requests.packages.urllib3.util.retry import Retry
+
+
+def _session_with_retries():
+    """A requests.Session that automatically retries on 429 / 5xx with
+    exponential backoff, honouring the Retry-After header. This is what makes
+    the script safe when many company runs hit HubSpot/Amplemarket at once
+    (e.g. a bulk property update fanning out into 20 parallel GitHub runs)."""
+    retry_kwargs = dict(
+        total=6, connect=3, read=3, status=6,
+        backoff_factor=2.0,                         # waits ~2,4,8,16,32,... s
+        status_forcelist=(429, 500, 502, 503, 504),
+        respect_retry_after_header=True,
+        raise_on_status=False,
+    )
+    try:                                            # urllib3 >= 1.26
+        retry = Retry(allowed_methods=frozenset(
+            ["GET", "POST", "PATCH", "PUT", "DELETE"]), **retry_kwargs)
+    except TypeError:                               # older urllib3
+        retry = Retry(method_whitelist=frozenset(
+            ["GET", "POST", "PATCH", "PUT", "DELETE"]), **retry_kwargs)
+    adapter = HTTPAdapter(max_retries=retry)
+    s = requests.Session()
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+
 # ============================================================================
 # EDIT ME  --  titles to look up at every domain
 # ============================================================================
@@ -66,74 +98,144 @@ except ImportError:
 # below, which (a) keeps only these target roles and (b) drops support staff /
 # inactive people via EXCLUDE_TERMS.
 TITLES = [
-    "CEO", "CFO", "Founder", "President", "Owner", "COO", "Diretor of Operations", "VP of Finance", "Head of Operations"
+    "CEO", "CFO", "COO", "President", "Founder", "Owner",
+    "VP of Finance", "Director of Operations", "Head of Operations",
 ]
 
 EXACT_TITLE_MATCH = False           # False -> catch target roles joined with other titles
 
-# --- Target roles kept (add/remove phrases here) ----------------------------
-# Matched as whole words after normalizing punctuation, so "co-founder & ceo"
-# still matches "ceo". "President" is matched only when NOT part of
-# "Vice/EVP/SVP/AVP President". "Owner" excludes "product/process owner".
-_TARGET_RE = re.compile(
-    r"\b(?:"
-    r"ceo|chief executive officer|"
-    r"cfo|chief financial officer|"
-    r"coo|chief operating officer|"
-    r"cto|chief technology officer|chief technical officer|"
-    r"founder|founding (?:partner|member|team)|"
-    r"owner|"
-    r"head of product|chief product officer|cpo|"
-    r"head of ai|head of artificial intelligence|chief ai officer|"
-    r"finance director|director of finance|"
-    r"head of operations|head of ops|"
-    r"head of revenue operations|revenue operations|director of revenue operations"
-    r")\b"
-)
-_PRESIDENT_RE = re.compile(r"\bpresident\b")
-_VP_STRIP_RE = re.compile(r"\b(?:vice president|vp|evp|svp|avp)\b")
+# ===========================================================================
+# TITLE MATCHING  --  precision layer (edit the vocab lists to tune)
+# ---------------------------------------------------------------------------
+# The Amplemarket search (TITLES above) is deliberately broad; real precision is
+# enforced here. A headline role (CEO/CFO/COO/President/Owner) is accepted ONLY
+# when it appears "clean" — i.e. NOT immediately qualified by:
+#   * a SCOPE word   -> a division/region/subsidiary head, not the whole company
+#                       ("Group President", "Division President", "President, EMEA")
+#   * a FUNCTION word -> a functional head, not the top job
+#                       ("President of Sales", "President, Marketing")
+#   * a DEMOTION word -> not the actual top holder
+#                       ("Deputy CEO", "Vice President", "Assistant to the CEO")
+# Combos with another top role still pass ("President & CEO", "Co-Founder &
+# President"), because the clean top role is detected first.
+# ===========================================================================
 
-# --- Terms that DISQUALIFY a person (edit freely) ---------------------------
-# If any of these appears anywhere in the title, the person is skipped even if a
-# target role is also present (e.g. "Assistant to the CEO", "Former CFO").
+# Division / region / subsidiary qualifiers -> NOT the whole-entity top job.
+_SCOPE = (r"group|divisions?|divisional|segment|sub|business unit|unit|regions?|"
+          r"regional|area|zone|territory|countr(?:y|ies)|national|international|"
+          r"global|worldwide|americas?|emea|apac|latam|europe(?:an)?|asian?|"
+          r"pacific|middle east|africa|african|north|south|east|west|central|"
+          r"us|usa|united states|uk|canad(?:a|ian)|mexico|india|china|germany|"
+          r"france|brazil|australia|japan|subsidiary|affiliate|joint venture|jv|"
+          r"portfolio|board|club|chapter|student|association|society|chamber")
+
+# Function / department qualifiers -> a functional head, not the top job.
+_FUNCTION = (r"sales|marketing|financ(?:e|ial)|operations|operating|engineering|"
+             r"technolog(?:y|ies)|technical|products?|people|hr|human resources|"
+             r"talent|revenue|growth|commercial|legal|compliance|risk|"
+             r"communications?|brand|digital|data|analytics|information|it|"
+             r"security|supply chain|procurement|purchasing|manufacturing|quality|"
+             r"research|development|strategy|business development|"
+             r"corporate development|partnerships?|customers?|accounts?|field|"
+             r"retail|wholesale|ecommerce|e commerce|merchandising|creative|design|"
+             r"content|media|programs?|projects?|portfolio|investments?|lending|"
+             r"credit|underwriting|claims|actuarial|tax|audit|treasury|accounting|"
+             r"logistics|transportation|warehous(?:e|ing)|fulfillment|distribution|"
+             r"process|scrum|story|community|change")
+
+# Not-the-actual-holder modifiers (checked only right next to the role).
+# NOTE: interim/acting are intentionally NOT here — an interim CEO is still the
+# person running the company.
+_DEMOTE = (r"deputy|vice|assistant|asst|associate|aspiring|former|ex|previous|"
+           r"past|outgoing|retired|emeritus|honorary|elect|junior|jr|to the|"
+           r"office of the|chief of staff")
+
+_DEMOTE_RE  = re.compile(r"\b(?:%s)$" % _DEMOTE)      # ends the words just before the role
+_SCOPE_END  = re.compile(r"\b(?:%s)$" % _SCOPE)
+_FUNC_END   = re.compile(r"\b(?:%s)$" % _FUNCTION)
+_SCOPE_HEAD = re.compile(r"^(?:%s)\b" % _SCOPE)       # starts the words just after the role
+_FUNC_HEAD  = re.compile(r"^(?:%s)\b" % _FUNCTION)
+_CONN_HEAD  = re.compile(r"^(?:of|for|to|in|the)\b")  # 'of/for/the' bridge to a qualifier
+
+# Headline roles (order = label priority; any clean match wins).
+_ROLE_CEO   = re.compile(r"\b(?:ceo|chief exec(?:utive)?(?: officer)?)\b")
+_ROLE_CFO   = re.compile(r"\b(?:cfo|chief financ(?:e|ial)(?: officer)?)\b")
+_ROLE_COO   = re.compile(r"\b(?:coo|chief operating(?: officer)?|chief operations(?: officer)?)\b")
+_ROLE_PRES  = re.compile(r"\bpresident\b")
+_ROLE_FOUND = re.compile(r"\b(?:cofounder|co founder|founder|founding (?:partner|member|team))\b")
+_ROLE_OWNER = re.compile(r"\b(?:co owner|coowner|owner|proprietor)\b")
+
+# Specific extra roles you asked for (function-locked; VP/SVP/EVP of Finance,
+# Director/Head of Operations). These are NOT top-level-locked.
+_ROLE_VPFIN = re.compile(r"\b(?:(?:e|s|a)?vp|vice president)(?: of| for|,)? financ(?:e|ial)\b")
+_ROLE_DIROPS = re.compile(r"\b(?:director of operations|operations director|"
+                          r"director,? operations|ops director|director of ops)\b")
+_ROLE_HEADOPS = re.compile(r"\b(?:head of operations|head of ops|operations head)\b")
+
+# --- Global disqualifiers: if any appears anywhere, skip the person entirely --
 EXCLUDE_TERMS = [
-    # not the person, or support staff
     "assistant", "office of the", "chief of staff", "executive support",
-    # no longer in the role / not active
     "former", "ex", "retired", "emeritus", "outgoing", "previous", "past",
-    # not yet in the role / job seeking
+    "deputy", "elect",
     "aspiring", "student", "intern", "internship", "trainee", "apprentice",
     "seeking", "open to work", "looking for", "unemployed", "job seeker", "candidate",
-    # junior modifiers (guard the RevOps / generic matches)
     "junior", "jr", "analyst", "coordinator", "associate", "specialist", "clerk",
-    # non-operator advisory / scrum "owner"
     "advisor", "adviser", "board member", "non executive", "freelance",
     "self employed", "product owner", "process owner", "scrum",
 ]
-# whole-word match so "ex" won't fire inside "executive", "jr" inside a name, etc.
 _EXCLUDE_RE = re.compile(r"\b(?:" + "|".join(re.escape(t.strip()) for t in EXCLUDE_TERMS if t.strip())
                          + r")\b")
 
 
 def _norm_title(t):
-    t = (t or "").lower().replace(".", "")           # C.E.O -> ceo
-    t = t.replace("&", " and ").replace("/", " ")
-    t = re.sub(r"[^a-z0-9 ]+", " ", t)               # hyphens etc. -> space
+    """Lowercase, expand '&', drop all other punctuation to spaces (so
+    'Co-Founder & CEO', 'COO/CFO', 'President, Sales' all normalise cleanly)."""
+    t = (t or "").lower().replace(".", "").replace("&", " and ")
+    t = re.sub(r"[^a-z0-9 ]+", " ", t)
     return re.sub(r"\s+", " ", t).strip()
 
 
-def matches_target(title):
-    """True if the title is one of the target senior/active roles (possibly joined
-    with other titles) and contains no disqualifying term."""
-    t = _norm_title(title)
-    if not t:
-        return False
-    if _EXCLUDE_RE.search(t):                         # any disqualifying term -> skip
-        return False
-    if _TARGET_RE.search(t):
+def _clean_role(t, role_re, block_scope=True, block_function=True):
+    """True if role_re occurs as a *clean* role — no demotion, and (optionally)
+    no scope/function qualifier immediately before or after it."""
+    for m in role_re.finditer(t):
+        pre = " ".join(t[:m.start()].split()[-3:])          # up to 3 words before
+        if _DEMOTE_RE.search(pre):
+            continue
+        if block_scope and _SCOPE_END.search(pre):
+            continue
+        if block_function and _FUNC_END.search(pre):
+            continue
+        tail = t[m.end():].lstrip()                          # words after the role
+        tail = _CONN_HEAD.sub("", tail).lstrip()             # step over of/for/the
+        tail = _CONN_HEAD.sub("", tail).lstrip()             # (e.g. 'of the americas')
+        if block_scope and _SCOPE_HEAD.search(tail):
+            continue
+        if block_function and _FUNC_HEAD.search(tail):
+            continue
         return True
-    # President only if not a Vice/E/S/A-VP President
-    return bool(_PRESIDENT_RE.search(_VP_STRIP_RE.sub(" ", t)))
+    return False
+
+
+def matches_target(title):
+    """Return a canonical role label if the title truly is one of the target
+    roles (top-level for the headline roles), else None. First match wins."""
+    t = _norm_title(title)
+    if not t or _EXCLUDE_RE.search(t):
+        return None
+    if _clean_role(t, _ROLE_CEO):                       return "CEO"
+    if _clean_role(t, _ROLE_CFO):                       return "CFO"
+    if _clean_role(t, _ROLE_COO):                       return "COO"
+    if _ROLE_FOUND.search(t):                           return "Founder"
+    if _clean_role(t, _ROLE_OWNER, block_scope=False,
+                   block_function=False):               return "Owner"
+    if _clean_role(t, _ROLE_PRES):                      return "President"
+    if _ROLE_VPFIN.search(t):                           return "VP of Finance"
+    if _ROLE_DIROPS.search(t):                          return "Director of Operations"
+    if _ROLE_HEADOPS.search(t):                         return "Head of Operations"
+    return None
+
+
 LOCATIONS = ["United States", "Canada"]   # person_locations search filter; set to [] to disable
 
 # Require contacts to be based in an allowed country (US or Canada). This is a
@@ -318,7 +420,7 @@ def load_domains(spec):
 class Amplemarket:
     def __init__(self, api_key):
         self.base = AMPLEMARKET_BASE
-        self.s = requests.Session()
+        self.s = _session_with_retries()
         self.s.headers.update({"Authorization": f"Bearer {api_key}",
                                "Content-Type": "application/json"})
 
@@ -434,7 +536,7 @@ class Amplemarket:
 class HubSpot:
     def __init__(self, token):
         self.base = HUBSPOT_BASE
-        self.s = requests.Session()
+        self.s = _session_with_retries()
         self.s.headers.update({"Authorization": f"Bearer {token}",
                                "Content-Type": "application/json"})
 
